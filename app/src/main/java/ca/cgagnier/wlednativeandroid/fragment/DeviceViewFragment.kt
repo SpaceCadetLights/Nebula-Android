@@ -1,14 +1,18 @@
 package ca.cgagnier.wlednativeandroid.fragment
 
 import android.annotation.SuppressLint
+import android.app.DownloadManager
 import android.content.Context
+import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
+import android.os.Environment
 import android.util.Log
 import android.view.*
 import android.webkit.*
+import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.view.menu.MenuBuilder
 import androidx.core.view.MenuProvider
@@ -17,44 +21,61 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.updateLayoutParams
 import androidx.fragment.app.Fragment
 import androidx.fragment.app.activityViewModels
+import androidx.fragment.app.setFragmentResult
+import androidx.fragment.app.viewModels
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.asLiveData
 import androidx.navigation.fragment.findNavController
 import androidx.navigation.ui.AppBarConfiguration
 import androidx.navigation.ui.setupWithNavController
+import ca.cgagnier.wlednativeandroid.BuildConfig
+import ca.cgagnier.wlednativeandroid.DeviceEditActivity
 import ca.cgagnier.wlednativeandroid.DevicesApplication
 import ca.cgagnier.wlednativeandroid.FileUploadContract
 import ca.cgagnier.wlednativeandroid.FileUploadContractResult
 import ca.cgagnier.wlednativeandroid.R
 import ca.cgagnier.wlednativeandroid.databinding.FragmentDeviceViewBinding
 import ca.cgagnier.wlednativeandroid.model.Device
+import ca.cgagnier.wlednativeandroid.repository.DeviceRepository
 import ca.cgagnier.wlednativeandroid.viewmodel.DeviceListViewModel
 import ca.cgagnier.wlednativeandroid.viewmodel.DeviceListViewModelFactory
+import ca.cgagnier.wlednativeandroid.viewmodel.DeviceViewViewModel
+import ca.cgagnier.wlednativeandroid.viewmodel.DeviceViewViewModelFactory
 import ca.cgagnier.wlednativeandroid.viewmodel.WebViewViewModel
 import com.google.android.material.appbar.MaterialToolbar
+import java.net.URLEncoder
+import java.text.SimpleDateFormat
+import java.util.Date
 
 
 class DeviceViewFragment : Fragment() {
 
+    private val deviceRepository: DeviceRepository by lazy {
+        (requireActivity().application as DevicesApplication).deviceRepository
+    }
+    private val deviceViewViewModel: DeviceViewViewModel by viewModels {
+        DeviceViewViewModelFactory()
+    }
     private val deviceListViewModel: DeviceListViewModel by activityViewModels {
         DeviceListViewModelFactory(
-            (requireActivity().application as DevicesApplication).deviceRepository,
+            deviceRepository,
             (requireActivity().application as DevicesApplication).userPreferencesRepository
         )
     }
 
-    private var loadingCounter = 0
-    private var activeDevice: Device? = null
-    private var isLargeLayout: Boolean = false
-    private lateinit var onBackPressedCallback: OnBackPressedCallback
     private lateinit var webViewViewModel: WebViewViewModel
     private lateinit var _webview: WebView
 
+    private var initialLoad = true
+    private lateinit var deviceAddress: String
+    private lateinit var device: Device
+
+    private var isLargeLayout: Boolean = false
+    private lateinit var onBackPressedCallback: OnBackPressedCallback
+
     private var _binding: FragmentDeviceViewBinding? = null
     private val binding get() = _binding!!
-
-    private var shouldResetHistory = false
-    private var shouldShowErrorPage = false
 
     var uploadMessage: ValueCallback<Array<Uri>>? = null
 
@@ -69,16 +90,23 @@ class DeviceViewFragment : Fragment() {
             uploadMessage = null
         }
 
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        arguments?.let {
+            deviceAddress = it.getString(DEVICE_ADDRESS)!!
+        }
+    }
+
     override fun onAttach(context: Context) {
         super.onAttach(context)
 
         onBackPressedCallback = object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
-                if (_webview.canGoBack()) {
-                    navigateBack()
+                if (webCanGoBack()) {
+                    webGoBack()
                 } else {
                     isEnabled = false
-                    loadingCounter = 0
+                    deviceViewViewModel.loadingCounter = 0
                     requireActivity().onBackPressedDispatcher.onBackPressed()
                     isEnabled = true
                 }
@@ -92,7 +120,8 @@ class DeviceViewFragment : Fragment() {
         container: ViewGroup?,
         savedInstanceState: Bundle?
     ): View {
-        Log.i(TAG_NAME, "Device view creating")
+        WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG)
+        Log.i(TAG, "Device view creating")
         _binding = FragmentDeviceViewBinding.inflate(layoutInflater, container, false)
         isLargeLayout = resources.getBoolean(R.bool.large_layout)
         return binding.root
@@ -101,9 +130,7 @@ class DeviceViewFragment : Fragment() {
     @SuppressLint("SetJavaScriptEnabled")
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
-        Log.i(TAG_NAME, "Device view created")
-        setMenu(binding.deviceToolbar)
-        updateTitle()
+        Log.i(TAG, "Device view created")
 
         ViewCompat.setOnApplyWindowInsetsListener(binding.deviceToolbarContainer) { insetView, windowInsets ->
             val insets = windowInsets.getInsets(WindowInsetsCompat.Type.statusBars())
@@ -113,77 +140,40 @@ class DeviceViewFragment : Fragment() {
             WindowInsetsCompat.CONSUMED
         }
 
-        var fromRestore = false
         val webViewFactory = WebViewViewModel.Factory(requireActivity())
         webViewViewModel = ViewModelProvider(this, webViewFactory)[WebViewViewModel::class.java]
         webViewViewModel.webView().observe(viewLifecycleOwner) { webView: WebView ->
             _webview = webView
+            loadDevice()
 
-            if (!webViewViewModel.firstLoad) {
-                Log.i(TAG_NAME, "Webview restored")
-                fromRestore = true
-            } else {
-                Log.i(TAG_NAME, "Webview first load")
+            if (webViewViewModel.firstLoad) {
+                Log.i(TAG, "Webview first load")
                 webViewViewModel.firstLoad = false
                 webView.setBackgroundColor(Color.TRANSPARENT)
 
                 // Prevent urls from opening in external browser
                 webView.webViewClient = object : WebViewClient() {
-                    override fun shouldOverrideUrlLoading(
-                        view: WebView?,
-                        request: WebResourceRequest?
-                    ): Boolean {
-                        _binding?.pageLoadingIndicator?.visibility = View.VISIBLE
-                        if (!request?.isRedirect!! && view?.canGoBack() == true) {
-                            val webBackForwardList = view.copyBackForwardList()
-                            val currentIndex = webBackForwardList.currentIndex
-                            if (webBackForwardList.getItemAtIndex(currentIndex - 1).url == request.url.toString()) {
-                                Log.i(TAG_NAME, "Overriding url, going back")
-                                view.goBack()
-                                return true
-                            } else if (request.url?.path == "/") {
-                                Log.i(TAG_NAME, "Overriding url, going back -${currentIndex}")
-                                view.goBackOrForward(-currentIndex)
-                            }
-                        }
-
-                        return false
-                    }
 
                     override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                         super.onPageStarted(view, url, favicon)
                         updateNavigationState()
-                        Log.i(TAG_NAME, "page started $url, counter: $loadingCounter")
+                        Log.i(
+                            TAG,
+                            "page started $url, counter: ${deviceViewViewModel.loadingCounter}"
+                        )
                     }
 
                     override fun onPageFinished(view: WebView?, url: String?) {
                         super.onPageFinished(view, url)
                         updateNavigationState()
-                        loadingCounter--
-                        Log.i(TAG_NAME, "page finished $url, counter: $loadingCounter")
-                        if (loadingCounter <= 0) {
+                        deviceViewViewModel.loadingCounter--
+                        Log.i(
+                            TAG,
+                            "page finished $url, counter: ${deviceViewViewModel.loadingCounter}"
+                        )
+                        if (deviceViewViewModel.loadingCounter <= 0) {
                             _binding?.pageLoadingIndicator?.visibility = View.GONE
-                            loadingCounter = 0
-                        }
-                        if (url == "about:blank") {
-                            Log.i(TAG_NAME, "page finished - cleared history")
-                            shouldResetHistory = true
-                            if (shouldShowErrorPage) {
-                                shouldShowErrorPage = false
-                                showLoadingIndicator()
-                                view?.loadUrl("file:///android_asset/device_error.html")
-                            } else {
-                                activeDevice?.let {
-                                    Log.i(TAG_NAME, "onPageFinished Requesting '${it.address}'")
-                                    showLoadingIndicator()
-                                    view?.loadUrl("http://${it.address}")
-                                }
-                            }
-                        } else if (shouldResetHistory) {
-                            Log.i(TAG_NAME, "Clearing history")
-                            shouldResetHistory = false
-                            view?.clearHistory()
-                            updateNavigationState()
+                            deviceViewViewModel.loadingCounter = 0
                         }
                     }
 
@@ -193,6 +183,18 @@ class DeviceViewFragment : Fragment() {
                         isReload: Boolean
                     ) {
                         super.doUpdateVisitedHistory(view, url, isReload)
+                        Log.i(TAG, "doUpdateVisitedHistory $url, isReload: $isReload")
+
+                        if (url != null && !isReload) {
+                            if (deviceViewViewModel.isGoingBack) {
+                                deviceViewViewModel.isGoingBack = false
+                            } else if (deviceViewViewModel.currentUrl.isNotEmpty()) {
+                                deviceViewViewModel.backQueue.addLast(deviceViewViewModel.currentUrl)
+                            }
+                            filterBackQueue(url)
+
+                            deviceViewViewModel.currentUrl = url
+                        }
                         updateNavigationState()
                     }
 
@@ -203,13 +205,12 @@ class DeviceViewFragment : Fragment() {
                     ) {
                         if (request?.isForMainFrame == true) {
                             Log.i(
-                                TAG_NAME,
+                                TAG,
                                 "Error received ${request.url} - ${error?.description}"
                             )
 
-                            shouldShowErrorPage = true
-                            view?.loadUrl("about:blank")
-                            view?.clearHistory()
+                            showLoadingIndicator()
+                            view?.loadUrl("file:///android_asset/device_error.html")
                         }
                         super.onReceivedError(view, request, error)
                     }
@@ -228,42 +229,42 @@ class DeviceViewFragment : Fragment() {
                     }
                 }
 
+                webView.setDownloadListener { url, _, contentDisposition, mimetype, _ ->
+                    val request = DownloadManager.Request(
+                        Uri.parse(url)
+                    )
+                    request.setNotificationVisibility(
+                        DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED
+                    )
+
+                    @SuppressLint("SimpleDateFormat")
+                    val formatter = SimpleDateFormat("yyyyMMdd")
+                    val currentDate = formatter.format(Date())
+                    val deviceName = URLEncoder.encode(device.name, "UTF-8")
+                    val fileName = URLUtil.guessFileName(url, contentDisposition, mimetype)
+                    val fullFilename = "${deviceName}_${currentDate}_${fileName}"
+                    request.setDestinationInExternalPublicDir(
+                        Environment.DIRECTORY_DOWNLOADS,
+                        fullFilename
+                    )
+                    val dm =
+                        requireContext().getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager?
+                    dm!!.enqueue(request)
+                    Toast.makeText(
+                        requireContext(),
+                        getString(R.string.downloading_file),
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+
+
                 webView.settings.javaScriptEnabled = true
                 webView.settings.domStorageEnabled = true
-
-                if (savedInstanceState != null && !fromRestore) {
-                    savedInstanceState.getBundle(BUNDLE_WEBVIEW_STATE)
-                        ?.let {
-                            Log.i(TAG_NAME, "Restoring webview from bundle")
-                            _webview.restoreState(it)
-                            fromRestore = true
-                        }
-                }
+            } else {
+                Log.i(TAG, "Webview restored")
             }
 
             binding.deviceWebViewContainer.addView(webView)
-        }
-
-        deviceListViewModel.activeDevice.observe(viewLifecycleOwner) {
-            activeDevice = it
-            updateTitle()
-            if (fromRestore) {
-                fromRestore = false
-                return@observe
-            }
-            if (!deviceListViewModel.expectDeviceChange) {
-                Log.d(TAG_NAME, "observed device, but did not expect changes")
-                return@observe
-            }
-            Log.i(TAG_NAME, "observed device")
-            deviceListViewModel.expectDeviceChange = false
-            loadingCounter = 0
-
-            // Let the "page finished" event load the new url
-            showLoadingIndicator()
-            _webview.loadUrl("about:blank")
-            _webview.clearHistory()
-            updateNavigationState()
         }
     }
 
@@ -274,7 +275,34 @@ class DeviceViewFragment : Fragment() {
 
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
-        outState.putBundle(BUNDLE_WEBVIEW_STATE, webViewViewModel.bundle)
+    }
+
+    private fun loadDevice() {
+        deviceRepository.findLiveDeviceByAddress(deviceAddress).asLiveData()
+            .observe(viewLifecycleOwner) {
+                it?.let { newDevice ->
+                    device = newDevice
+                    if (initialLoad) {
+                        initialLoad = false
+                        initialLoad()
+                    } else {
+                        updateTitle()
+                    }
+                }
+            }
+    }
+
+    private fun initialLoad() {
+        Log.i(TAG, "initialLoad")
+        setMenu(binding.deviceToolbar)
+        updateTitle()
+
+        if (!deviceViewViewModel.webAlreadyLoaded) {
+            deviceViewViewModel.webAlreadyLoaded = true
+            showLoadingIndicator()
+            Log.i(TAG, "initialLoad Requesting '${device.address}'")
+            _webview.loadUrl("http://${device.address}")
+        }
     }
 
     private fun setMenu(toolbar: MaterialToolbar) {
@@ -284,23 +312,22 @@ class DeviceViewFragment : Fragment() {
         )
         toolbar.setNavigationIcon(androidx.appcompat.R.drawable.abc_ic_ab_back_material)
         toolbar.setNavigationOnClickListener {
-            Log.d(DeviceListFragment.TAG, "closing slidingPaneLayout")
-            deviceListViewModel.expectDeviceChange = false
-            onBackPressedCallback.isEnabled = false
-            requireActivity().onBackPressedDispatcher.onBackPressed()
-            onBackPressedCallback.isEnabled = true
+            if (deviceListViewModel.isTwoPane.value == true) {
+                Log.d(TAG, "Requesting list to be hidden")
+                setFragmentResult(DeviceListFragment.REQUEST_LIST_VISIBLITY_TOGGLE, Bundle())
+            } else {
+                Log.d(DeviceListFragment.TAG, "closing slidingPaneLayout")
+                onBackPressedCallback.isEnabled = false
+                requireActivity().onBackPressedDispatcher.onBackPressed()
+                onBackPressedCallback.isEnabled = true
+            }
         }
 
         deviceListViewModel.isTwoPane.observe(viewLifecycleOwner) {
             updateNavigationState()
         }
-
-        deviceListViewModel.doRefreshWeb.observe(viewLifecycleOwner) {
-            if (!it) {
-                return@observe
-            }
-            deviceListViewModel.doRefreshWeb.value = false
-            refresh()
+        deviceListViewModel.isListHidden.observe(viewLifecycleOwner) {
+            updateNavigationState()
         }
 
         toolbar.addMenuProvider(object : MenuProvider {
@@ -320,18 +347,8 @@ class DeviceViewFragment : Fragment() {
 
             override fun onMenuItemSelected(menuItem: MenuItem): Boolean {
                 return when (menuItem.itemId) {
-                    R.id.action_browse_back -> {
-                        navigateBack()
-                        true
-                    }
-
-                    R.id.action_browse_forward -> {
-                        navigateForward()
-                        true
-                    }
-
                     R.id.action_browse_refresh -> {
-                        Log.i(TAG_NAME, "Manual refresh requested")
+                        Log.i(TAG, "Manual refresh requested")
                         refresh()
                         true
                     }
@@ -354,13 +371,13 @@ class DeviceViewFragment : Fragment() {
 
             fun updateMenuState(menu: Menu) {
                 // Handle for example visibility of menu items
-                menu.findItem(R.id.action_browse_back).isEnabled = _webview.canGoBack()
-                menu.findItem(R.id.action_browse_forward).isEnabled = _webview.canGoForward()
-                menu.findItem(R.id.action_browse_update).isVisible =
-                    activeDevice?.hasUpdateAvailable() ?: false
-
+                menu.findItem(R.id.action_browse_update).isVisible = device.hasUpdateAvailable()
                 if (deviceListViewModel.isTwoPane.value == true) {
-                    toolbar.navigationIcon = null
+                    if (deviceListViewModel.isListHidden.value == true) {
+                        toolbar.setNavigationIcon(R.drawable.dock_to_right_24)
+                    } else {
+                        toolbar.setNavigationIcon(R.drawable.baseline_menu_open_24)
+                    }
                 }
             }
         }, viewLifecycleOwner, Lifecycle.State.RESUMED)
@@ -368,35 +385,16 @@ class DeviceViewFragment : Fragment() {
 
     fun refresh() {
         updateTitle()
-        activeDevice?.let {
-            Log.i(TAG_NAME, "refresh Requesting '${it.address}'")
-            showLoadingIndicator()
-            _webview.loadUrl("http://${it.address}")
-        }
+        Log.i(TAG, "refresh Requesting '${device.address}'")
+        showLoadingIndicator()
+        _webview.loadUrl("http://${device.address}")
     }
 
     private fun updateTitle() {
-        Log.d(TAG_NAME, "Updating title")
-        binding.deviceToolbar.title =
-            activeDevice?.name ?: getString(R.string.select_a_device)
-        binding.deviceToolbar.subtitle = activeDevice?.address
+        Log.d(TAG, "Updating title")
+        binding.deviceToolbar.title = device.name
+        binding.deviceToolbar.subtitle = device.address
         updateNavigationState()
-    }
-
-    fun navigateBack(): Boolean {
-        if (_webview.canGoBack()) {
-            _webview.goBack()
-            return true
-        }
-        return false
-    }
-
-    fun navigateForward(): Boolean {
-        if (_webview.canGoForward()) {
-            _webview.goForward()
-            return true
-        }
-        return false
     }
 
     fun updateNavigationState() {
@@ -405,26 +403,64 @@ class DeviceViewFragment : Fragment() {
 
     fun showLoadingIndicator() {
         _binding?.pageLoadingIndicator?.visibility = View.VISIBLE
-        loadingCounter++
+        deviceViewViewModel.loadingCounter++
     }
 
     fun showUpdateDialog() {
         val fragmentManager = requireActivity().supportFragmentManager
-        val deviceAddress = activeDevice?.address ?: return
+        val deviceAddress = device.address
         val newFragment =
             DeviceUpdateAvailableFragment.newInstance(deviceAddress, isLargeLayout)
         newFragment.show(fragmentManager, "dialog")
     }
 
     fun showEditDevice() {
-        val deviceAddress = activeDevice?.address ?: return
-        val dialog =
-            DeviceEditFragment.newInstance(deviceAddress, resources.getBoolean(R.bool.large_layout))
-        dialog.show(requireActivity().supportFragmentManager, "device_edit")
+        val intent = Intent(requireActivity(), DeviceEditActivity::class.java)
+        intent.putExtra(DeviceEditActivity.EXTRA_DEVICE_ADDRESS, device.address)
+        startActivity(intent)
+    }
+
+    fun webCanGoBack(): Boolean {
+        return deviceViewViewModel.backQueue.isNotEmpty()
+    }
+
+    fun webGoBack(): Boolean {
+        if (webCanGoBack()) {
+            val backUrl = deviceViewViewModel.backQueue.removeLast()
+            _webview.loadUrl(backUrl)
+            deviceViewViewModel.isGoingBack = true
+            return true
+        }
+        return false
+    }
+
+    private fun filterBackQueue(currentUrl: String) {
+        Log.i(TAG, "== Starting filter ========")
+        Log.i(TAG, "Current Url: $currentUrl")
+        Log.i(TAG, deviceViewViewModel.backQueue.toString())
+        var i = deviceViewViewModel.backQueue.size
+        for (url in deviceViewViewModel.backQueue.asReversed()) {
+            i--
+            if (url == currentUrl) {
+                deviceViewViewModel.backQueue.subList(i, deviceViewViewModel.backQueue.size).clear()
+                Log.i(TAG, "Removing up to $i")
+                Log.i(TAG, deviceViewViewModel.backQueue.toString())
+                return
+            }
+        }
     }
 
     companion object {
-        const val TAG_NAME = "deviceWebview"
-        const val BUNDLE_WEBVIEW_STATE = "bundleWebviewStateKey"
+        const val TAG = "deviceWebview"
+
+        private const val DEVICE_ADDRESS = "device_address"
+
+        @JvmStatic
+        fun newInstance(deviceAddress: String) =
+            DeviceViewFragment().apply {
+                arguments = Bundle().apply {
+                    putString(DEVICE_ADDRESS, deviceAddress)
+                }
+            }
     }
 }
